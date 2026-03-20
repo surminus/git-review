@@ -23,8 +23,6 @@ go build -o git-review .
 
 ## Testing
 
-There aren't any tests yet, but if you add some, run them with:
-
 ```
 go test ./...
 ```

@@ -621,7 +621,7 @@ func cmdPrompt(args []string) error {
 		return err
 	}
 	if strings.TrimSpace(diff) == "" {
-		return fmt.Errorf("no diff")
+		return nil
 	}
 
 	scope := diffScope(diff)
@@ -630,7 +630,7 @@ func cmdPrompt(args []string) error {
 		return err
 	}
 	if len(a) == 0 {
-		return fmt.Errorf("no annotations found — nothing to prompt with")
+		return nil
 	}
 
 	// Filter hunks to only those with annotations.

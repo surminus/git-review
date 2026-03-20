@@ -22,6 +22,7 @@ jobs:
         run: |
           gofmt -l . | grep . && exit 1 || true
           go vet ./...
+          go test ./...
 
       - name: Build binaries
         run: |
