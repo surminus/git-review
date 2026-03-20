@@ -593,8 +593,28 @@ func cmdShow(args []string) error {
 	return nil
 }
 
-// cmdPrompt outputs a self-contained prompt to stdout with the diff and all
-// annotations, suitable for piping into an AI coding agent.
+// hunkHasAnnotation returns true if any line in the hunk has an annotation.
+func hunkHasAnnotation(h hunk, a annotations) bool {
+	lineNo := h.newStart
+	for _, l := range h.lines {
+		if len(l) == 0 {
+			continue
+		}
+		switch l[0] {
+		case '+', ' ':
+			key := fmt.Sprintf("%s:%d", h.file, lineNo)
+			if _, ok := a[key]; ok {
+				return true
+			}
+			lineNo++
+		}
+	}
+	return false
+}
+
+// cmdPrompt outputs a self-contained prompt to stdout with only the
+// annotated hunks and their comments, suitable for piping into an AI
+// coding agent.
 func cmdPrompt(args []string) error {
 	diff, err := getDiff(args)
 	if err != nil {
@@ -613,41 +633,38 @@ func cmdPrompt(args []string) error {
 		return fmt.Errorf("no annotations found — nothing to prompt with")
 	}
 
-	fmt.Println("I have a git diff with review comments. Please apply the feedback from each annotation to the corresponding file and line. Here is the full diff:")
-	fmt.Println()
-	fmt.Println("```diff")
-	fmt.Print(diff)
-	fmt.Println("```")
-	fmt.Println()
-	fmt.Println("Here are the review annotations to action:")
-	fmt.Println()
-
-	// Group annotations by file for clarity
-	byFile := make(map[string][]struct {
-		line    int
-		comment string
-	})
-	for key, comment := range a {
-		parts := strings.SplitN(key, ":", 2)
-		if len(parts) != 2 {
-			continue
+	// Filter hunks to only those with annotations.
+	var annotated []hunk
+	for _, h := range parseDiff(diff) {
+		if hunkHasAnnotation(h, a) {
+			annotated = append(annotated, h)
 		}
-		file := parts[0]
-		line, err := strconv.Atoi(parts[1])
-		if err != nil {
-			continue
-		}
-		byFile[file] = append(byFile[file], struct {
-			line    int
-			comment string
-		}{line, comment})
 	}
 
-	for file, comments := range byFile {
-		fmt.Printf("### %s\n\n", file)
-		for _, c := range comments {
-			fmt.Printf("- **Line %d**: %s\n", c.line, c.comment)
+	fmt.Println("I have review comments on a git diff. Please apply the feedback from each annotation to the corresponding file and line.")
+	fmt.Println()
+
+	for _, h := range annotated {
+		fmt.Println("```diff")
+		fmt.Fprintf(os.Stdout, "--- a/%s\n", h.file)
+		fmt.Fprintf(os.Stdout, "+++ b/%s\n", h.file)
+		fmt.Println(h.header)
+		lineNo := h.newStart
+		for _, l := range h.lines {
+			if len(l) == 0 {
+				continue
+			}
+			fmt.Println(l)
+			switch l[0] {
+			case '+', ' ':
+				key := fmt.Sprintf("%s:%d", h.file, lineNo)
+				if c, ok := a[key]; ok {
+					fmt.Printf("# REVIEW [%s:%d]: %s\n", h.file, lineNo, c)
+				}
+				lineNo++
+			}
 		}
+		fmt.Println("```")
 		fmt.Println()
 	}
 
