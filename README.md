@@ -36,9 +36,8 @@ git review annotate --cached
 git review annotate HEAD~3
 ```
 
-For each hunk, you'll be shown the diff with line numbers and prompted
-to enter a line number to comment on. Press Enter to skip to the next
-hunk.
+For each hunk, you'll be shown the diff and can choose to [c]omment,
+[s]plit the hunk into smaller pieces, or press Enter to skip.
 
 ### Show
 
@@ -49,14 +48,14 @@ git review show
 git review show --cached
 ```
 
-### Apply
+### Prompt
 
 Output a self-contained prompt to stdout with the full diff and all
 annotations, formatted for an AI coding agent:
 
 ```
-git review apply | claude
-git review apply --cached | claude
+git review prompt | claude
+git review prompt --cached | claude
 ```
 
 ### Clear

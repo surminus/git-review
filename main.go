@@ -1,5 +1,5 @@
 // git-review: a local diff annotation tool for reviewing git diffs with
-// line-level comments.
+// hunk-level comments.
 //
 // Install to somewhere on $PATH (e.g. /usr/local/bin/git-review) to use
 // as a git subcommand: git review annotate, git review show, etc.
@@ -7,6 +7,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -35,7 +37,10 @@ func reviewFilePath() (string, error) {
 // annotations is a map of "file:line" -> comment.
 type annotations map[string]string
 
-func loadAnnotations() (annotations, error) {
+// scopedAnnotations maps a diff hash to its annotations.
+type scopedAnnotations map[string]annotations
+
+func loadAllAnnotations() (scopedAnnotations, error) {
 	p, err := reviewFilePath()
 	if err != nil {
 		return nil, err
@@ -43,23 +48,41 @@ func loadAnnotations() (annotations, error) {
 	data, err := os.ReadFile(p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return make(annotations), nil
+			return make(scopedAnnotations), nil
 		}
 		return nil, err
 	}
-	var a annotations
-	if err := json.Unmarshal(data, &a); err != nil {
+	var sa scopedAnnotations
+	if err := json.Unmarshal(data, &sa); err != nil {
 		return nil, fmt.Errorf("corrupt review.json: %w", err)
+	}
+	return sa, nil
+}
+
+func loadAnnotations(scope string) (annotations, error) {
+	all, err := loadAllAnnotations()
+	if err != nil {
+		return nil, err
+	}
+	a, ok := all[scope]
+	if !ok {
+		return make(annotations), nil
 	}
 	return a, nil
 }
 
-func saveAnnotations(a annotations) error {
+func saveAnnotations(scope string, a annotations) error {
+	all, err := loadAllAnnotations()
+	if err != nil {
+		return err
+	}
+	all[scope] = a
+
 	p, err := reviewFilePath()
 	if err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(a, "", "  ")
+	data, err := json.MarshalIndent(all, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -68,10 +91,11 @@ func saveAnnotations(a annotations) error {
 
 // hunk represents a single diff hunk with its context.
 type hunk struct {
-	file    string
-	header  string
+	file     string
+	header   string
+	oldStart int
 	newStart int
-	lines   []string // raw diff lines within the hunk (including +/-/space prefixes)
+	lines    []string // raw diff lines within the hunk (including +/-/space prefixes)
 }
 
 // parseDiff splits raw unified diff output into hunks, tracking which file
@@ -81,14 +105,13 @@ func parseDiff(diff string) []hunk {
 	var currentFile string
 	var current *hunk
 
-	hunkRegex := regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
+	hunkRegex := regexp.MustCompile(`^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
 
 	for _, line := range strings.Split(diff, "\n") {
 		// Track current file from the +++ header, which works regardless
 		// of diff.noprefix or a/b prefix settings.
-		if strings.HasPrefix(line, "+++ ") {
-			name := strings.TrimPrefix(line, "+++ ")
-			name = strings.TrimPrefix(name, "b/") // strip optional b/ prefix
+		if name, ok := strings.CutPrefix(line, "+++ "); ok {
+			name, _ = strings.CutPrefix(name, "b/") // strip optional b/ prefix
 			if name != "/dev/null" {
 				currentFile = name
 			}
@@ -100,11 +123,13 @@ func parseDiff(diff string) []hunk {
 			if current != nil {
 				hunks = append(hunks, *current)
 			}
-			start, _ := strconv.Atoi(m[1])
+			oldStart, _ := strconv.Atoi(m[1])
+			newStart, _ := strconv.Atoi(m[2])
 			current = &hunk{
 				file:     currentFile,
 				header:   line,
-				newStart: start,
+				oldStart: oldStart,
+				newStart: newStart,
 			}
 			continue
 		}
@@ -122,33 +147,179 @@ func parseDiff(diff string) []hunk {
 	return hunks
 }
 
-// newLineNumbers returns the new-file line numbers present in this hunk,
-// in order. Only lines that appear in the new file (context and additions)
-// are included.
-func (h hunk) newLineNumbers() []int {
-	var nums []int
+// splitHunk splits a hunk into sub-hunks at change group boundaries.
+// Returns nil if the hunk has only one change group (can't be split).
+func splitHunk(h hunk) []hunk {
+	// Identify change groups: contiguous runs of +/- lines.
+	type changeGroup struct {
+		startIdx int // index into h.lines
+		endIdx   int // exclusive
+	}
+
+	var groups []changeGroup
+	inChange := false
+	for i, l := range h.lines {
+		if len(l) == 0 {
+			continue
+		}
+		isChange := l[0] == '+' || l[0] == '-'
+		if isChange && !inChange {
+			groups = append(groups, changeGroup{startIdx: i})
+			inChange = true
+		} else if !isChange && inChange {
+			groups[len(groups)-1].endIdx = i
+			inChange = false
+		}
+	}
+	if inChange {
+		groups[len(groups)-1].endIdx = len(h.lines)
+	}
+
+	if len(groups) <= 1 {
+		return nil
+	}
+
+	// Precompute old/new line offsets for each index in h.lines.
+	type lineOffset struct {
+		oldLine int
+		newLine int
+	}
+	offsets := make([]lineOffset, len(h.lines))
+	oldLine := h.oldStart
+	newLine := h.newStart
+	for i, l := range h.lines {
+		offsets[i] = lineOffset{oldLine, newLine}
+		if len(l) == 0 {
+			continue
+		}
+		switch l[0] {
+		case '+':
+			newLine++
+		case '-':
+			oldLine++
+		case ' ':
+			oldLine++
+			newLine++
+		}
+	}
+
+	// Build sub-hunks: each change group gets up to 3 lines of leading/trailing
+	// context, capped so it doesn't overlap into adjacent change groups.
+	const contextLines = 3
+	var subHunks []hunk
+
+	for gi, g := range groups {
+		leadStart := max(g.startIdx-contextLines, 0)
+		if gi > 0 {
+			leadStart = max(leadStart, groups[gi-1].endIdx)
+		}
+
+		trailEnd := min(g.endIdx+contextLines, len(h.lines))
+		if gi+1 < len(groups) {
+			trailEnd = min(trailEnd, groups[gi+1].startIdx)
+		}
+
+		subLines := h.lines[leadStart:trailEnd]
+
+		subOldStart := offsets[leadStart].oldLine
+		subNewStart := offsets[leadStart].newLine
+
+		var oldCount, newCount int
+		for _, l := range subLines {
+			if len(l) == 0 {
+				continue
+			}
+			switch l[0] {
+			case '+':
+				newCount++
+			case '-':
+				oldCount++
+			case ' ':
+				oldCount++
+				newCount++
+			}
+		}
+
+		header := fmt.Sprintf("@@ -%d,%d +%d,%d @@", subOldStart, oldCount, subNewStart, newCount)
+
+		linesCopy := make([]string, len(subLines))
+		copy(linesCopy, subLines)
+
+		subHunks = append(subHunks, hunk{
+			file:     h.file,
+			header:   header,
+			oldStart: subOldStart,
+			newStart: subNewStart,
+			lines:    linesCopy,
+		})
+	}
+
+	return subHunks
+}
+
+// firstNewLine returns the first new-file line number that's an addition
+// (+ line) in this hunk. Falls back to newStart if there are no additions.
+func (h hunk) firstNewLine() int {
 	lineNo := h.newStart
 	for _, l := range h.lines {
 		if len(l) == 0 {
 			continue
 		}
 		switch l[0] {
-		case '+', ' ':
-			nums = append(nums, lineNo)
+		case '+':
+			return lineNo
+		case ' ':
 			lineNo++
-		case '-':
-			// removed line, doesn't exist in new file
 		}
 	}
-	return nums
+	return h.newStart
 }
 
-// formatHunk returns a human-readable string for the hunk, with new-file
-// line numbers in the margin for context and added lines.
+// diffFilter returns the interactive.diffFilter config value, if set.
+// This is the same filter git add -p uses (e.g. "delta --color-only").
+func diffFilter() string {
+	out, err := exec.Command("git", "config", "interactive.diffFilter").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// formatHunk returns a human-readable string for the hunk. If an
+// interactive.diffFilter is configured (e.g. delta --color-only), the
+// raw diff is piped through it, matching git add -p behaviour. Otherwise
+// basic ANSI colours are used.
 func (h hunk) formatHunk() string {
+	// Build a raw diff fragment for the filter.
+	var raw strings.Builder
+	fmt.Fprintf(&raw, "--- a/%s\n", h.file)
+	fmt.Fprintf(&raw, "+++ b/%s\n", h.file)
+	fmt.Fprintln(&raw, h.header)
+	for _, l := range h.lines {
+		fmt.Fprintln(&raw, l)
+	}
+
+	if filter := diffFilter(); filter != "" {
+		cmd := exec.Command("sh", "-c", filter)
+		cmd.Stdin = strings.NewReader(raw.String())
+		out, err := cmd.Output()
+		if err == nil {
+			return string(out)
+		}
+	}
+
+	// Fallback: basic ANSI colours.
+	const (
+		red   = "\033[31m"
+		green = "\033[32m"
+		cyan  = "\033[36m"
+		bold  = "\033[1m"
+		reset = "\033[0m"
+	)
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "--- %s\n", h.file)
-	fmt.Fprintf(&b, "%s\n", h.header)
+	fmt.Fprintf(&b, "%s%s--- %s%s\n", bold, cyan, h.file, reset)
+	fmt.Fprintf(&b, "%s%s%s\n", cyan, h.header, reset)
 
 	lineNo := h.newStart
 	for _, l := range h.lines {
@@ -157,10 +328,10 @@ func (h hunk) formatHunk() string {
 		}
 		switch l[0] {
 		case '+':
-			fmt.Fprintf(&b, "%4d %s\n", lineNo, l)
+			fmt.Fprintf(&b, "%4d %s%s%s\n", lineNo, green, l, reset)
 			lineNo++
 		case '-':
-			fmt.Fprintf(&b, "     %s\n", l)
+			fmt.Fprintf(&b, "     %s%s%s\n", red, l, reset)
 		case ' ':
 			fmt.Fprintf(&b, "%4d %s\n", lineNo, l)
 			lineNo++
@@ -178,8 +349,61 @@ func getDiff(extraArgs []string) (string, error) {
 	return string(out), nil
 }
 
+// diffScope returns a SHA256 hash of the diff content, used to scope
+// annotations so they don't cross-contaminate between branches or
+// different diff ranges.
+func diffScope(diff string) string {
+	h := sha256.Sum256([]byte(diff))
+	return hex.EncodeToString(h[:])
+}
+
+// resolvePager uses git's own pager resolution (GIT_PAGER -> core.pager
+// -> PAGER -> less).
+func resolvePager() string {
+	out, err := exec.Command("git", "var", "GIT_PAGER").Output()
+	if err != nil {
+		return "less"
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// isTerminal returns true if stdout is connected to a terminal.
+func isTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// outputThroughPager sends text through the configured pager. The pager
+// is invoked via sh -c, matching how git itself runs pagers.
+func outputThroughPager(text string) error {
+	pager := resolvePager()
+
+	cmd := exec.Command("sh", "-c", pager)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+
+	if err := cmd.Start(); err != nil {
+		// If pager fails to start, just print directly
+		fmt.Print(text)
+		return nil
+	}
+
+	stdin.Write([]byte(text))
+	stdin.Close()
+
+	return cmd.Wait()
+}
+
 // cmdAnnotate walks through hunks interactively, prompting the user to
-// attach comments.
+// attach comments per hunk.
 func cmdAnnotate(args []string) error {
 	diff, err := getDiff(args)
 	if err != nil {
@@ -190,13 +414,14 @@ func cmdAnnotate(args []string) error {
 		return nil
 	}
 
-	hunks := parseDiff(diff)
-	if len(hunks) == 0 {
+	queue := parseDiff(diff)
+	if len(queue) == 0 {
 		fmt.Println("No hunks found in diff.")
 		return nil
 	}
 
-	a, err := loadAnnotations()
+	scope := diffScope(diff)
+	a, err := loadAnnotations(scope)
 	if err != nil {
 		return err
 	}
@@ -204,66 +429,48 @@ func cmdAnnotate(args []string) error {
 	scanner := bufio.NewScanner(os.Stdin)
 	added := 0
 
-	for _, h := range hunks {
+	for len(queue) > 0 {
+		h := queue[0]
+		queue = queue[1:]
+
 		fmt.Println()
 		fmt.Println(h.formatHunk())
+		lineNo := h.firstNewLine()
+		fmt.Printf("  %s:%d — review hunk (empty to skip, s[plit], q[uit]): ", h.file, lineNo)
 
-		lineNums := h.newLineNumbers()
-		if len(lineNums) == 0 {
-			continue
+		if !scanner.Scan() {
+			break
 		}
+		input := strings.TrimSpace(scanner.Text())
 
-		// Show available line range
-		fmt.Printf("  Lines %d–%d in %s\n", lineNums[0], lineNums[len(lineNums)-1], h.file)
-		fmt.Printf("  Add comment for %s:<line>? [line number to comment, or Enter to skip] ", h.file)
-
-		for {
-			if !scanner.Scan() {
-				break
+		quit := false
+		switch strings.ToLower(input) {
+		case "s":
+			subHunks := splitHunk(h)
+			if subHunks == nil {
+				fmt.Println("  Can't split further (single change group).")
+				queue = append([]hunk{h}, queue...)
+			} else {
+				queue = append(subHunks, queue...)
 			}
-			input := strings.TrimSpace(scanner.Text())
-			if input == "" {
-				break
-			}
-
-			lineNo, err := strconv.Atoi(input)
-			if err != nil {
-				fmt.Printf("  Not a valid line number. Try again or Enter to skip: ")
-				continue
-			}
-
-			// Check the line is within this hunk's range
-			found := false
-			for _, n := range lineNums {
-				if n == lineNo {
-					found = true
-					break
-				}
-			}
-			if !found {
-				fmt.Printf("  Line %d isn't in this hunk. Try again or Enter to skip: ", lineNo)
-				continue
-			}
-
-			fmt.Printf("  Comment for %s:%d: ", h.file, lineNo)
-			if !scanner.Scan() {
-				break
-			}
-			comment := strings.TrimSpace(scanner.Text())
-			if comment == "" {
-				fmt.Printf("  Empty comment, skipping. Another line or Enter to move on: ")
-				continue
-			}
-
+		case "q":
+			quit = true
+		case "":
+			// skip
+		default:
+			// anything else is a comment
 			key := fmt.Sprintf("%s:%d", h.file, lineNo)
-			a[key] = comment
+			a[key] = input
 			added++
-			fmt.Printf("  Noted. Another line or Enter to move on: ")
+			fmt.Println("  Noted.")
+		}
+		if quit {
+			break
 		}
 	}
 
 	if added > 0 {
-		if err := saveAnnotations(a); err != nil {
+		if err := saveAnnotations(scope, a); err != nil {
 			return err
 		}
 		fmt.Printf("\nSaved %d annotation(s).\n", added)
@@ -273,7 +480,10 @@ func cmdAnnotate(args []string) error {
 	return nil
 }
 
-// cmdShow prints the diff with annotations inlined after the relevant lines.
+// cmdShow outputs the diff with annotations, piped through the user's
+// configured pager when stdout is a terminal. Annotations are placed at
+// hunk boundaries (not inside hunks) so pagers like delta can still
+// parse the unified diff format.
 func cmdShow(args []string) error {
 	diff, err := getDiff(args)
 	if err != nil {
@@ -284,70 +494,123 @@ func cmdShow(args []string) error {
 		return nil
 	}
 
-	a, err := loadAnnotations()
+	scope := diffScope(diff)
+	a, err := loadAnnotations(scope)
 	if err != nil {
 		return err
 	}
+
+	// No annotations: exec git diff directly so git uses its own pager
+	// chain (delta, less, etc.) with full colour support.
 	if len(a) == 0 {
-		fmt.Println("No annotations found. Showing plain diff.")
-		fmt.Println()
-		fmt.Print(diff)
-		return nil
+		cmd := exec.Command("git", append([]string{"diff"}, args...)...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		return cmd.Run()
 	}
 
-	hunks := parseDiff(diff)
+	// Walk the raw diff, collecting annotations per hunk and flushing
+	// them at hunk/file boundaries so we don't break the diff format.
+	var buf strings.Builder
+	var currentFile string
+	var inHunk bool
+	var lineNo int
+	var pending []string
 
-	for _, h := range hunks {
-		fmt.Printf("--- %s\n", h.file)
-		fmt.Println(h.header)
+	hunkRe := regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
 
-		lineNo := h.newStart
-		for _, l := range h.lines {
-			if len(l) == 0 {
-				continue
+	flush := func() {
+		for _, p := range pending {
+			fmt.Fprintln(&buf, p)
+		}
+		pending = pending[:0]
+	}
+
+	for _, line := range strings.Split(diff, "\n") {
+		isHunkHeader := hunkRe.MatchString(line)
+		isFileHeader := strings.HasPrefix(line, "diff ") ||
+			strings.HasPrefix(line, "index ") ||
+			strings.HasPrefix(line, "--- ") ||
+			strings.HasPrefix(line, "+++ ")
+
+		if (isHunkHeader || isFileHeader) && len(pending) > 0 {
+			flush()
+		}
+
+		if name, ok := strings.CutPrefix(line, "+++ "); ok {
+			name, _ = strings.CutPrefix(name, "b/")
+			if name != "/dev/null" {
+				currentFile = name
 			}
-			switch l[0] {
+			inHunk = false
+			fmt.Fprintln(&buf, line)
+			continue
+		}
+
+		if m := hunkRe.FindStringSubmatch(line); m != nil {
+			lineNo, _ = strconv.Atoi(m[1])
+			inHunk = true
+			fmt.Fprintln(&buf, line)
+			continue
+		}
+
+		if isFileHeader {
+			inHunk = false
+			fmt.Fprintln(&buf, line)
+			continue
+		}
+
+		if inHunk && len(line) > 0 {
+			fmt.Fprintln(&buf, line)
+			switch line[0] {
 			case '+':
-				fmt.Printf("%4d %s\n", lineNo, l)
-				key := fmt.Sprintf("%s:%d", h.file, lineNo)
+				key := fmt.Sprintf("%s:%d", currentFile, lineNo)
 				if c, ok := a[key]; ok {
-					fmt.Printf("     # REVIEW: %s\n", c)
+					pending = append(pending, fmt.Sprintf("# REVIEW [%s:%d]: %s", currentFile, lineNo, c))
+				}
+				lineNo++
+			case ' ':
+				key := fmt.Sprintf("%s:%d", currentFile, lineNo)
+				if c, ok := a[key]; ok {
+					pending = append(pending, fmt.Sprintf("# REVIEW [%s:%d]: %s", currentFile, lineNo, c))
 				}
 				lineNo++
 			case '-':
-				fmt.Printf("     %s\n", l)
-			case ' ':
-				fmt.Printf("%4d %s\n", lineNo, l)
-				key := fmt.Sprintf("%s:%d", h.file, lineNo)
-				if c, ok := a[key]; ok {
-					fmt.Printf("     # REVIEW: %s\n", c)
-				}
-				lineNo++
+				// deleted line, no new-file line number
 			}
+		} else {
+			fmt.Fprintln(&buf, line)
 		}
-		fmt.Println()
 	}
+	flush()
 
+	output := buf.String()
+	if isTerminal() {
+		return outputThroughPager(output)
+	}
+	fmt.Print(output)
 	return nil
 }
 
-// cmdApply outputs a self-contained prompt to stdout with the diff and all
+// cmdPrompt outputs a self-contained prompt to stdout with the diff and all
 // annotations, suitable for piping into an AI coding agent.
-func cmdApply(args []string) error {
+func cmdPrompt(args []string) error {
 	diff, err := getDiff(args)
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(diff) == "" {
-		return fmt.Errorf("no diff to apply")
+		return fmt.Errorf("no diff")
 	}
 
-	a, err := loadAnnotations()
+	scope := diffScope(diff)
+	a, err := loadAnnotations(scope)
 	if err != nil {
 		return err
 	}
 	if len(a) == 0 {
-		return fmt.Errorf("no annotations found — nothing to apply")
+		return fmt.Errorf("no annotations found — nothing to prompt with")
 	}
 
 	fmt.Println("I have a git diff with review comments. Please apply the feedback from each annotation to the corresponding file and line. Here is the full diff:")
@@ -393,7 +656,7 @@ func cmdApply(args []string) error {
 	return nil
 }
 
-// cmdClear removes the review.json file.
+// cmdClear removes the review.json file (all scopes).
 func cmdClear() error {
 	p, err := reviewFilePath()
 	if err != nil {
@@ -416,7 +679,7 @@ func usage() {
 Commands:
   annotate [diff args]   Walk through the diff hunk by hunk and add comments
   show     [diff args]   Print the diff with annotations inline
-  apply    [diff args]   Output a prompt with the diff and annotations (pipe to an AI agent)
+  prompt   [diff args]   Output a prompt with the diff and annotations (pipe to an AI agent)
   clear                  Remove all annotations
 
 Any extra arguments after the subcommand are passed through to git diff
@@ -439,8 +702,8 @@ func main() {
 		err = cmdAnnotate(rest)
 	case "show":
 		err = cmdShow(rest)
-	case "apply":
-		err = cmdApply(rest)
+	case "prompt":
+		err = cmdPrompt(rest)
 	case "clear":
 		err = cmdClear()
 	case "-h", "--help", "help":
