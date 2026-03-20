@@ -410,13 +410,11 @@ func cmdAnnotate(args []string) error {
 		return err
 	}
 	if strings.TrimSpace(diff) == "" {
-		fmt.Println("No diff to annotate.")
 		return nil
 	}
 
 	queue := parseDiff(diff)
 	if len(queue) == 0 {
-		fmt.Println("No hunks found in diff.")
 		return nil
 	}
 
@@ -474,8 +472,6 @@ func cmdAnnotate(args []string) error {
 			return err
 		}
 		fmt.Printf("\nSaved %d annotation(s).\n", added)
-	} else {
-		fmt.Println("\nNo annotations added.")
 	}
 	return nil
 }
@@ -490,7 +486,6 @@ func cmdShow(args []string) error {
 		return err
 	}
 	if strings.TrimSpace(diff) == "" {
-		fmt.Println("No diff.")
 		return nil
 	}
 
@@ -681,7 +676,6 @@ func cmdClear() error {
 	}
 	if err := os.Remove(p); err != nil {
 		if os.IsNotExist(err) {
-			fmt.Println("Nothing to clear.")
 			return nil
 		}
 		return err
